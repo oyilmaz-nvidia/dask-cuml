@@ -242,13 +242,14 @@ class RandomForestClassifier:
                     
         wait(f)
 
+        indexes = list()
         rslts = list()
         for d in range(len(f)):   
             rslts.append(f[d].result())
+            indexes.append(0)
                     
         pred = list()
-        ind = 0
-        
+                
         for i in range(len(X)):
             classes = dict()
             max_class = -1
@@ -256,7 +257,7 @@ class RandomForestClassifier:
             
             for d in range(len(rslts)):               
                 for j in range(self.n_estimators_per_worker[d]):
-                    sub_ind = ind + j
+                    sub_ind = indexes[d] + j
                     cls = rslts[d][sub_ind]
                     if cls not in classes.keys():
                         classes[cls] = 1
@@ -267,8 +268,8 @@ class RandomForestClassifier:
                         max_val = classes[cls]
                         max_class = cls
 
-            # This part needs update. All the workers need separate ind
-            ind = ind + self.n_estimators_per_worker[0]
+                indexes[d] = indexes[d] + self.n_estimators_per_worker[d]
+
             pred.append(max_class)
             
         
