@@ -14,71 +14,20 @@
 # limitations under the License.
 #
 
-from dask.distributed import Client
-from cuml.common.handle import Handle
+from dask.distributed import Client, wait, default_client, get_worker
+from dask_cuml.core import parse_host_port
 from dask import delayed
+from cuml.common.handle import Handle
 import dask.dataframe as dd
-from dask.distributed import wait, default_client
-from dask.distributed import get_worker
 import numba.cuda
-import cudf
-import numpy as np
-import pandas as pd
 import random
-import asyncio
-import uuid
-
 from tornado import gen
-from dask.distributed import default_client
 from toolz import first
-import logging
-import dask.dataframe as dd
-import dask_cudf
-import numpy as np
-import cudf
-import pandas as pd
-from dask.distributed import wait
 from cuml.ensemble import RandomForestClassifier as cuRFC
-from cuml import LinearRegression as cuLinearRegression
-from cuml.neighbors import NearestNeighbors as cuKNN
 import math
-
-def parse_host_port(address):
-    if '://' in address:
-        address = address.rsplit('://', 1)[1]
-    host, port = address.split(':')
-    port = int(port)
-    return host, port
-
-import dask_cudf
-
-@gen.coroutine
-def extract_ddf_partitions(ddf):
-    """
-    Given a Dask cuDF, return a tuple with (worker, future) for each partition
-    """
-    client = default_client()
-    
-    delayed_ddf = ddf.to_delayed()
-    parts = client.compute(delayed_ddf)
-    yield wait(parts)
-    
-    key_to_part_dict = dict([(str(part.key), part) for part in parts])
-    who_has = yield client.who_has(parts)
-
-    worker_map = []
-    for key, workers in who_has.items():
-        worker = parse_host_port(first(workers))
-        worker_map.append((worker, key_to_part_dict[key]))
-
-    gpu_data = [(worker, part) for worker, part in worker_map]
-
-    yield wait(gpu_data)
-
-    raise gen.Return(gpu_data)
     
 @gen.coroutine
-def extract_ddf_partitions_dict(ddf):
+def _extract_ddf_partitions(ddf):
     """
     Given a Dask cuDF, return a tuple with (worker, future) for each partition
     """
@@ -102,21 +51,61 @@ def extract_ddf_partitions_dict(ddf):
 
     raise gen.Return(gpu_data)
 
-def get_meta(df):
-    ret = df.iloc[:0]
-    return ret
-
-def to_dask_cudf(futures):
-    # Convert a list of futures containing dfs back into a dask_cudf
-    dfs = [d for d in futures if d.type != type(None)]
-    meta = c.submit(get_meta, dfs[0]).result()
-    return dd.from_delayed(dfs, meta=meta)
-
-async def connection_func(ep, listener):
-    print("connection received from " + str(ep))
-
 
 class RandomForestClassifier:
+    """
+    Implements a multi-GPU Random Forest classifier model which fits multiple decision
+    tree classifiers in an ensemble.
+
+    Please check the single-GPU implementation of Random Forest classifier for more information
+    about the algorithm.
+
+    Parameters
+    -----------
+    n_estimators : int (default = 10)
+                   number of trees in the forest.
+    handle : cuml.Handle
+             If it is None, a new one is created just for this class.
+    split_criterion: The criterion used to split nodes.
+                     0 for GINI, 1 for ENTROPY, 4 for CRITERION_END.
+                     2 and 3 not valid for classification
+                     (default = 0)
+    split_algo : 0 for HIST and 1 for GLOBAL_QUANTILE
+                 (default = 0)
+                 the algorithm to determine how nodes are split in the tree.
+    split_criterion: The criterion used to split nodes.
+                     0 for GINI, 1 for ENTROPY, 4 for CRITERION_END.
+                     2 and 3 not valid for classification
+                     (default = 0)
+    bootstrap : boolean (default = True)
+                Control bootstrapping.
+                If set, each tree in the forest is built
+                on a bootstrapped sample with replacement.
+                If false, sampling without replacement is done.
+    bootstrap_features : boolean (default = False)
+                         Control bootstrapping for features.
+                         If features are drawn with or without replacement
+    rows_sample : float (default = 1.0)
+                  Ratio of dataset rows used while fitting each tree.
+    max_depth : int (default = -1)
+                Maximum tree depth. Unlimited (i.e, until leaves are pure),
+                if -1.
+    max_leaves : int (default = -1)
+                 Maximum leaf nodes per tree. Soft constraint. Unlimited,
+                 if -1.
+    max_features : float (default = 1.0)
+                   Ratio of number of features (columns) to consider
+                   per node split.
+    n_bins :  int (default = 8)
+              Number of bins used by the split algorithm.
+    min_rows_per_node : int (default = 2)
+                        The minimum number of samples (rows) needed
+                        to split a node.
+    quantile_per_tree : boolean (default = False)
+                        Whether quantile is computed for individal trees in RF.
+                        Only relevant for GLOBAL_QUANTILE split_algo.
+
+    """
     
     def __init__(self, n_estimators=10, max_depth=-1, handle=None,
                   max_features=1.0, n_bins=8,
@@ -125,10 +114,7 @@ class RandomForestClassifier:
                   type_model="classifier", verbose=False,
                   rows_sample=1.0, max_leaves=-1,
                   gdf_datatype=None):
-        """
-        Creates local rf instance on each worker
-        """
-        
+                
         self.handle = handle
         self.split_algo = split_algo
         self.min_rows_per_node = min_rows_per_node
@@ -149,20 +135,17 @@ class RandomForestClassifier:
         
         n_workers = len(workers)
         if n_estimators < n_workers:
-            n_estimators = n_workers
+            raise ValueError('n_estimators cannot be lower than number of dask workers.')
         
         n_est_per_worker = math.floor(n_estimators / n_workers)
-        if n_est_per_worker < 1:
-            n_est_per_worker = 1
-            
+                    
         for i in range(n_workers):
             self.n_estimators_per_worker.append(n_est_per_worker)
             
         remaining_est = n_estimators - (n_est_per_worker * n_workers)
-        n_est_per_worker = math.ceil(remaining_est / n_workers)
-        
+                
         for i in range(remaining_est):
-            self.n_estimators_per_worker[i] = self.n_estimators_per_worker[i] + n_est_per_worker
+            self.n_estimators_per_worker[i] = self.n_estimators_per_worker[i] + 1
                     
         ws = list(zip(workers, list(range(len(workers)))))
                 
@@ -213,10 +196,18 @@ class RandomForestClassifier:
         return model.predictAllDTs(X)
     
     def fit(self, X, y):
+        """
+        Fit the input data to Random Forest classifier
+
+        Parameters
+        ----------
+        X : Acceptable format: dask-cudf. Dense matrix (floats or doubles) of shape (n_samples, n_features).
+        y : Acceptable format: dask-cudf. Dense matrix (floats or doubles) of shape (n_samples, 1)
+        """
         c = default_client()
 
-        X_futures = c.sync(extract_ddf_partitions_dict, X)
-        y_futures = c.sync(extract_ddf_partitions_dict, y)
+        X_futures = c.sync(_extract_ddf_partitions, X)
+        y_futures = c.sync(_extract_ddf_partitions, y)
                                        
         f = list()
         for w, xc in X_futures.items():     
@@ -227,7 +218,20 @@ class RandomForestClassifier:
         
         return self
     
-    def predict(self, X):                
+    def predict(self, X):              
+        """
+        Predicts the labels for X.
+
+        Parameters
+        ----------
+        X : Acceptable format: dask-cudf. Dense matrix (floats or doubles) of shape (n_samples, n_features).
+
+        Returns
+        ----------
+        y: NumPy
+           Dense vector (int) of shape (n_samples, 1)
+
+        """  
         c = default_client()
         workers = c.has_what().keys()
         
@@ -275,5 +279,35 @@ class RandomForestClassifier:
         
         return pred
                             
-    def fit_predict(self, X):
-        return self.fit(X).predict(X)
+    def get_params(self, deep=True):
+        """
+        Returns the value of all parameters
+        required to configure this estimator as a dictionary.
+        Parameters
+        -----------
+        deep : boolean (default = True)
+        """
+        params = dict()
+        for key in RandomForestClassifier.variables:
+            var_value = getattr(self, key, None)
+            params[key] = var_value
+        return params
+
+    def set_params(self, **params):
+        """
+        Sets the value of parameters required to
+        configure this estimator, it functions similar to
+        the sklearn set_params.
+        Parameters
+        -----------
+        params : dict of new params
+        """
+        if not params:
+            return self
+        for key, value in params.items():
+            if key not in RandomForestClassifier.variables:
+                raise ValueError('Invalid parameter for estimator')
+            else:
+                setattr(self, key, value)
+
+        return self
